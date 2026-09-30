@@ -1,0 +1,1001 @@
+package azure
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/textproto"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/google/uuid"
+	"github.com/grafana/dskit/flagext"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/tempo/v3/tempodb/backend"
+)
+
+func TestCredentials(t *testing.T) {
+	t.Parallel()
+	_, _, _, err := New(&Config{})
+	require.Error(t, err)
+
+	os.Setenv("AZURE_STORAGE_ACCOUNT", "testing")
+	os.Setenv("AZURE_STORAGE_KEY", "dGVzdGluZwo=")
+
+	defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
+	defer os.Unsetenv("AZURE_STORAGE_KEY")
+
+	count := int32(0)
+	server := fakeServer(t, 1*time.Second, &count)
+
+	_, _, _, err = New(&Config{
+		Endpoint: server.URL[7:], // [7:] -> strip http://,
+	})
+	require.NoError(t, err)
+}
+
+func TestHedge(t *testing.T) {
+	tests := []struct {
+		name                   string
+		returnIn               time.Duration
+		hedgeAt                time.Duration
+		expectedHedgedRequests int32
+	}{
+		{
+			name:                   "hedge disabled",
+			expectedHedgedRequests: 1,
+		},
+		{
+			name:                   "hedge enabled doesn't hit",
+			hedgeAt:                time.Hour,
+			expectedHedgedRequests: 1,
+		},
+		{
+			name:                   "hedge enabled and hits",
+			hedgeAt:                time.Millisecond,
+			returnIn:               100 * time.Millisecond,
+			expectedHedgedRequests: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			count := int32(0)
+			server := fakeServer(t, tc.returnIn, &count)
+
+			r, w, _, err := New(&Config{
+				StorageAccountName: "testing",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Endpoint:           server.URL[7:], // [7:] -> strip http://,
+				HedgeRequestsAt:    tc.hedgeAt,
+				HedgeRequestsUpTo:  2,
+			})
+			require.NoError(t, err)
+
+			ctx := context.Background()
+
+			// the first call on each client initiates an extra http request
+			// clearing that here
+			_, _, _ = r.Read(ctx, "object", backend.KeyPathForBlock(uuid.New(), "tenant"), nil)
+			time.Sleep(tc.returnIn)
+			atomic.StoreInt32(&count, 0)
+
+			// calls that should hedge
+			_, _, _ = r.Read(ctx, "object", backend.KeyPathForBlock(uuid.New(), "tenant"), nil)
+			time.Sleep(tc.returnIn)
+			assert.Equal(t, tc.expectedHedgedRequests*2, atomic.LoadInt32(&count)) // *2 b/c reads execute a HEAD and GET
+			atomic.StoreInt32(&count, 0)
+
+			// this panics with the garbage test setup. todo: make it not panic
+			// _ = r.ReadRange(ctx, "object", uuid.New(), "tenant", 10, make([]byte, 100))
+			// time.Sleep(tc.returnIn)
+			// assert.Equal(t, tc.expectedHedgedRequests, atomic.LoadInt32(&count))
+			// atomic.StoreInt32(&count, 0)
+
+			// calls that should not hedge
+			_, _ = r.List(ctx, backend.KeyPath{"test"})
+			assert.Equal(t, int32(1), atomic.LoadInt32(&count))
+			atomic.StoreInt32(&count, 0)
+
+			_ = w.Write(ctx, "object", backend.KeyPathForBlock(uuid.New(), "tenant"), bytes.NewReader(make([]byte, 10)), 10, nil)
+			// Write consists of two operations:
+			// - Put Block operation
+			//   https://docs.microsoft.com/en-us/rest/api/storageservices/put-block
+			// - Put Block List operation
+			//   https://docs.microsoft.com/en-us/rest/api/storageservices/put-block-list
+
+			// If the written bytes can fit in a single block, the Azure SDK will not call Put Block List, and will
+			// instead perform a single upload.
+			assert.Equal(t, int32(1), atomic.LoadInt32(&count))
+			// In order to more closely resemble a real-world upload scenario, and to force the SDK to call
+			// Put Block List, we deliberately create a payload that exceeds the size of a single block, forcing the
+			// SDK to make three requests in total: one request for each of the two blocks, and a final commit request.
+			// See azblob.UploadStreamOptions.BlockSize.
+
+			// TODO: this test periodically causes segfaults in the test and a root cause has not been determined.
+			// blockSize := 2000000
+			// u, err := uuid.Parse("f97223f3-d60c-4923-b255-bb7b8140b389")
+			// require.NoError(t, err)
+			// _ = w.Write(ctx, "object", backend.KeyPathForBlock(u, "tenant"), bytes.NewReader(make([]byte, blockSize)), 10, nil)
+			atomic.StoreInt32(&count, 0)
+		})
+	}
+}
+
+func fakeServer(t *testing.T, returnIn time.Duration, counter *int32) *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(returnIn)
+
+		atomic.AddInt32(counter, 1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func TestReadError(t *testing.T) {
+	// confirm blobNotFoundError converts to ErrDoesNotExist
+	blobNotFoundError := blobStorageError(string(bloberror.BlobNotFound))
+	err := readError(blobNotFoundError)
+	require.Equal(t, backend.ErrDoesNotExist, err)
+
+	// wrap blob not found error and confirm it still converts to ErrDoesNotExist
+	wrappedBlobNotFoundError := fmt.Errorf("wrap: %w", blobNotFoundError)
+	err = readError(wrappedBlobNotFoundError)
+	require.Equal(t, backend.ErrDoesNotExist, err)
+
+	// rando error is not returned as ErrDoesNotExist
+	randoError := errors.New("blerg")
+	err = readError(randoError)
+	require.NotEqual(t, backend.ErrDoesNotExist, err)
+
+	// other azure error is not returned as ErrDoesNotExist
+	otherAzureError := blobStorageError(string(bloberror.InternalError))
+	err = readError(otherAzureError)
+	require.NotEqual(t, backend.ErrDoesNotExist, err)
+}
+
+func blobStorageError(serviceCode string) error {
+	resp := &http.Response{
+		Header: http.Header{
+			textproto.CanonicalMIMEHeaderKey("x-ms-error-code"): []string{serviceCode},
+		},
+		Request: httptest.NewRequest("GET", "/blobby/blob", nil), // azure error handling code will panic if Request is unset
+	}
+
+	return runtime.NewResponseError(resp)
+}
+
+func TestObjectWithPrefix(t *testing.T) {
+	tests := []struct {
+		name        string
+		prefix      string
+		objectName  string
+		keyPath     backend.KeyPath
+		httpHandler func(t *testing.T) http.HandlerFunc
+	}{
+		{
+			name:       "with prefix",
+			prefix:     "test_prefix",
+			objectName: "object",
+			keyPath:    backend.KeyPath{"test_path"},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						_, _ = w.Write([]byte(``))
+						return
+					}
+
+					assert.Equal(t, "/testing_account/blerg/test_prefix/test_path/object", r.URL.Path)
+					w.WriteHeader(http.StatusCreated)
+				}
+			},
+		},
+		{
+			name:       "without prefix",
+			prefix:     "",
+			objectName: "object",
+			keyPath:    backend.KeyPath{"test_path"},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						_, _ = w.Write([]byte(``))
+						return
+					}
+
+					assert.Equal(t, "/testing_account/blerg/test_path/object", r.URL.Path)
+					w.WriteHeader(http.StatusCreated)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := testServer(t, tc.httpHandler(t))
+			_, w, _, err := New(&Config{
+				StorageAccountName: "testing_account",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Prefix:             tc.prefix,
+				Endpoint:           server.URL[7:], // [7:] -> strip http://,
+			})
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			err = w.Write(ctx, tc.objectName, tc.keyPath, bytes.NewReader([]byte{0}), 0, nil)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestDelete(t *testing.T) {
+	tests := []struct {
+		name        string
+		prefix      string
+		objectName  string
+		keyPath     backend.KeyPath
+		httpHandler func(t *testing.T) http.HandlerFunc
+	}{
+		{
+			name:       "with prefix",
+			prefix:     "test_prefix",
+			objectName: "object",
+			keyPath:    backend.KeyPath{"test_path"},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						_, _ = w.Write([]byte(``))
+						return
+					}
+
+					assert.Equal(t, "/testing_account/blerg/test_prefix/test_path/object", r.URL.Path)
+					w.WriteHeader(http.StatusAccepted)
+				}
+			},
+		},
+		{
+			name:       "without prefix",
+			prefix:     "",
+			objectName: "object",
+			keyPath:    backend.KeyPath{"test_path"},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						_, _ = w.Write([]byte(``))
+						return
+					}
+
+					assert.Equal(t, "/testing_account/blerg/test_path/object", r.URL.Path)
+					w.WriteHeader(http.StatusAccepted)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := testServer(t, tc.httpHandler(t))
+			_, w, _, err := New(&Config{
+				StorageAccountName: "testing_account",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Prefix:             tc.prefix,
+				Endpoint:           server.URL[7:], // [7:] -> strip http://,
+			})
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			err = w.Delete(ctx, tc.objectName, tc.keyPath, nil)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestListBlocksWithPrefix(t *testing.T) {
+	tests := []struct {
+		name              string
+		prefix            string
+		liveBlockIDs      []uuid.UUID
+		compactedBlockIDs []uuid.UUID
+		noCompactBlockIDs []uuid.UUID
+		tenant            string
+		httpHandler       func(t *testing.T) http.HandlerFunc
+	}{
+		{
+			name:              "with prefix",
+			prefix:            "a/b/c/",
+			tenant:            "single-tenant",
+			liveBlockIDs:      []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000000")},
+			compactedBlockIDs: []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000001")},
+			noCompactBlockIDs: []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000000")},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						assert.Equal(t, "a/b/c/single-tenant/", r.URL.Query().Get("prefix"))
+
+						_, _ = w.Write([]byte(`
+						<?xml version="1.0" encoding="utf-8"?>
+						<EnumerationResults ServiceEndpoint="http://myaccount.blob.core.windows.net/"  ContainerName="mycontainer">
+						  <Prefix>a/b/c/</Prefix>
+						  <MaxResults>100</MaxResults>
+						  <Blobs>
+							<Blob>
+							  <Name>a/b/c/single-tenant/00000000-0000-0000-0000-000000000000/meta.json</Name>
+							  <Url>https://myaccount.blob.core.windows.net/mycontainer/a/b/c/single-tenant/00000000-0000-0000-0000-000000000000/meta.json</Url>
+							  <Properties>
+								<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+								<Etag>0x8CBFF45D8A29A19</Etag>
+								<Content-Length>100</Content-Length>
+								<Content-Type>text/html</Content-Type>
+								<Content-Encoding />
+								<Content-Language>en-US</Content-Language>
+								<Content-MD5 />
+								<Cache-Control>no-cache</Cache-Control>
+								<BlobType>BlockBlob</BlobType>
+								<LeaseStatus>unlocked</LeaseStatus>
+							  </Properties>
+							</Blob>
+							
+							<Blob>
+							  <Name>a/b/c/single-tenant/00000000-0000-0000-0000-000000000000/nocompact.flg</Name>
+							  <Url>https://myaccount.blob.core.windows.net/mycontainer/a/b/c/single-tenant/00000000-0000-0000-0000-000000000000/nocompact.flg</Url>
+							  <Properties>
+								<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+								<Etag>0x8CBFF45D8A29A19</Etag>
+								<Content-Length>0</Content-Length>
+								<BlobType>BlockBlob</BlobType>
+								<LeaseStatus>unlocked</LeaseStatus>
+							  </Properties>
+							</Blob>
+
+							<Blob>
+							  <Name>a/b/c/single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json</Name>
+							  <Url>https://myaccount.blob.core.windows.net/mycontainer/a/b/c/single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json</Url>
+							  <Properties>
+								<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+								<Etag>0x8CBFF45D8A29A19</Etag>
+								<Content-Length>100</Content-Length>
+								<Content-Type>text/html</Content-Type>
+								<Content-Encoding />
+								<Content-Language>en-US</Content-Language>
+								<Content-MD5 />
+								<Cache-Control>no-cache</Cache-Control>
+								<BlobType>BlockBlob</BlobType>
+								<LeaseStatus>unlocked</LeaseStatus>
+							  </Properties>
+							</Blob>
+						  </Blobs>
+						  <NextMarker />
+						</EnumerationResults>
+						`))
+						return
+					}
+				}
+			},
+		},
+		{
+			name:              "without prefix",
+			prefix:            "",
+			tenant:            "single-tenant",
+			liveBlockIDs:      []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000000")},
+			compactedBlockIDs: []uuid.UUID{uuid.MustParse("00000000-0000-0000-0000-000000000001")},
+			httpHandler: func(t *testing.T) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "GET" {
+						assert.Equal(t, "single-tenant/", r.URL.Query().Get("prefix"))
+
+						_, _ = w.Write([]byte(`
+						<?xml version="1.0" encoding="utf-8"?>
+						<EnumerationResults ServiceEndpoint="http://myaccount.blob.core.windows.net/"  ContainerName="mycontainer">
+						  <Prefix></Prefix>
+						  <MaxResults>100</MaxResults>
+						  <Blobs>
+							<Blob>
+							  <Name>single-tenant/00000000-0000-0000-0000-000000000000/meta.json</Name>
+							  <Url>https://myaccount.blob.core.windows.net/mycontainer/single-tenant/00000000-0000-0000-0000-000000000000/meta.json</Url>
+							  <Properties>
+								<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+								<Etag>0x8CBFF45D8A29A19</Etag>
+								<Content-Length>100</Content-Length>
+								<Content-Type>text/html</Content-Type>
+								<Content-Encoding />
+								<Content-Language>en-US</Content-Language>
+								<Content-MD5 />
+								<Cache-Control>no-cache</Cache-Control>
+								<BlobType>BlockBlob</BlobType>
+								<LeaseStatus>unlocked</LeaseStatus>
+							  </Properties>
+							</Blob>
+
+							<Blob>
+							  <Name>single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json</Name>
+							  <Url>https://myaccount.blob.core.windows.net/mycontainer/single-tenant/00000000-0000-0000-0000-000000000001/meta.compacted.json</Url>
+							  <Properties>
+								<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+								<Etag>0x8CBFF45D8A29A19</Etag>
+								<Content-Length>100</Content-Length>
+								<Content-Type>text/html</Content-Type>
+								<Content-Encoding />
+								<Content-Language>en-US</Content-Language>
+								<Content-MD5 />
+								<Cache-Control>no-cache</Cache-Control>
+								<BlobType>BlockBlob</BlobType>
+								<LeaseStatus>unlocked</LeaseStatus>
+							  </Properties>
+							</Blob>
+						  </Blobs>
+                          <NextMarker />
+						</EnumerationResults>
+						`))
+						return
+					}
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := testServer(t, tc.httpHandler(t))
+			r, _, _, err := NewNoConfirm(&Config{
+				StorageAccountName: "testing_account",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Prefix:             tc.prefix,
+				Endpoint:           server.URL[7:], // [7:] -> strip http://,
+			})
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			blockIDs, compactedBlockIDs, noCompactBlockIDs, err2 := r.ListBlocks(ctx, tc.tenant)
+			assert.NoError(t, err2)
+
+			assert.ElementsMatchf(t, tc.liveBlockIDs, blockIDs, "Block IDs did not match")
+			assert.ElementsMatchf(t, tc.compactedBlockIDs, compactedBlockIDs, "Compacted block IDs did not match")
+			assert.ElementsMatchf(t, tc.noCompactBlockIDs, noCompactBlockIDs, "Nocompact block IDs did not match")
+		})
+	}
+}
+
+func TestMarkBlockCompacted_DoesNotDoublePrefix(t *testing.T) {
+	const prefix = "a/b/c/"
+	tenantID := "test-tenant"
+	blockID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+	// path.Join normalizes the trailing slash on prefix.
+	expectedDeletePath := "/testing_account/blerg/a/b/c/" + tenantID + "/" + blockID.String() + "/" + backend.MetaName
+
+	const body = `{}`
+	var capturedDeletePath string
+	server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			// readAll calls GetProperties first - SDK requires Content-Length and ETag.
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", `"etag123"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write([]byte(body))
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodDelete:
+			capturedDeletePath = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	_, _, compactor, err := NewNoConfirm(&Config{
+		StorageAccountName: "testing_account",
+		StorageAccountKey:  flagext.SecretWithValue("YQo="),
+		MaxBuffers:         3,
+		BufferSize:         1000,
+		ContainerName:      "blerg",
+		Prefix:             prefix,
+		Endpoint:           server.URL[7:], // [7:] -> strip http://
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, compactor.MarkBlockCompacted(blockID, tenantID))
+	assert.Equal(t, expectedDeletePath, capturedDeletePath,
+		"DELETE key path must contain the configured prefix exactly once")
+}
+
+// CompactedBlockMeta's NotFound path (blocklist/poller.go's pollBlock treats it
+// as a benign "block in an intermediate state", not a poll error) has no
+// coverage: TestReadError only tests the classification helper in isolation,
+// never that CompactedBlockMeta actually routes a real 404 through it.
+func TestCompactedBlockMeta_NotFound(t *testing.T) {
+	server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			// readAllWithModTime's readAll calls GetProperties (HEAD) first.
+			w.Header().Set("x-ms-error-code", string(bloberror.BlobNotFound))
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	_, _, compactor, err := NewNoConfirm(&Config{
+		StorageAccountName: "testing_account",
+		StorageAccountKey:  flagext.SecretWithValue("YQo="),
+		MaxBuffers:         3,
+		BufferSize:         1000,
+		ContainerName:      "blerg",
+		Endpoint:           server.URL[7:], // [7:] -> strip http://
+	})
+	require.NoError(t, err)
+
+	_, err = compactor.CompactedBlockMeta(uuid.New(), "tenant1")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, backend.ErrDoesNotExist))
+}
+
+func TestClearBlock_DoesNotDoublePrefix(t *testing.T) {
+	const (
+		prefix   = "a/b/c/"
+		tenantID = "test-tenant"
+		blockID  = "00000000-0000-0000-0000-000000000002"
+		blobPath = "a/b/c/test-tenant/00000000-0000-0000-0000-000000000002/data.parquet"
+	)
+	expectedDeletePath := "/testing_account/blerg/" + blobPath
+
+	var capturedDeletePath string
+	server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			assert.Equal(t, "a/b/c/test-tenant/"+blockID, r.URL.Query().Get("prefix"))
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+				<EnumerationResults>
+				  <Prefix>a/b/c/</Prefix>
+				  <Blobs>
+				    <Blob>
+				      <Name>a/b/c/test-tenant/00000000-0000-0000-0000-000000000002/data.parquet</Name>
+				      <Properties>
+				        <Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+				        <Etag>0x8CBFF45D8A29A19</Etag>
+				        <Content-Length>100</Content-Length>
+				        <BlobType>BlockBlob</BlobType>
+				      </Properties>
+				    </Blob>
+				  </Blobs>
+				  <NextMarker />
+				</EnumerationResults>`))
+		case http.MethodDelete:
+			capturedDeletePath = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	_, _, compactor, err := NewNoConfirm(&Config{
+		StorageAccountName: "testing_account",
+		StorageAccountKey:  flagext.SecretWithValue("YQo="),
+		MaxBuffers:         3,
+		BufferSize:         1000,
+		ContainerName:      "blerg",
+		Prefix:             prefix,
+		Endpoint:           server.URL[7:], // [7:] -> strip http://
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, compactor.ClearBlock(uuid.MustParse(blockID), tenantID))
+	assert.Equal(t, expectedDeletePath, capturedDeletePath,
+		"DELETE key path must contain the configured prefix exactly once")
+}
+
+func TestDeleteVersioned_DoesNotDoublePrefix(t *testing.T) {
+	const (
+		prefix             = "a/b/c/"
+		name               = "overrides.json"
+		etag               = `"etag123"`
+		body               = `{}`
+		expectedDeletePath = "/testing_account/blerg/a/b/c/overrides/tenant-1/" + name
+	)
+
+	var capturedDeletePath string
+	server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("ETag", etag)
+			_, _ = w.Write([]byte(body))
+		case http.MethodDelete:
+			capturedDeletePath = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	rw, err := NewVersionedReaderWriter(&Config{
+		StorageAccountName: "testing_account",
+		StorageAccountKey:  flagext.SecretWithValue("YQo="),
+		MaxBuffers:         3,
+		BufferSize:         1000,
+		ContainerName:      "blerg",
+		Prefix:             prefix,
+		Endpoint:           server.URL[7:], // [7:] -> strip http://
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, rw.DeleteVersioned(context.Background(), name, backend.KeyPath{"overrides", "tenant-1"}, backend.Version(etag)))
+	assert.Equal(t, expectedDeletePath, capturedDeletePath,
+		"DELETE key path must contain the configured prefix exactly once")
+}
+
+func testServer(t *testing.T, httpHandler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	assert.NotNil(t, httpHandler)
+	server := httptest.NewServer(httpHandler)
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestClearBlock_DeletesAllBlobsConcurrently(t *testing.T) {
+	const (
+		tenantID = "test-tenant"
+		blockID  = "00000000-0000-0000-0000-000000000003"
+	)
+
+	tests := []struct {
+		name     string
+		numBlobs int
+		wantMax  uint
+	}{
+		{"fewer blobs than the bound", 5, 5},
+		{"more blobs than the bound", 40, blobDeleteConcurrency},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var blobs strings.Builder
+			want := make([]string, 0, tt.numBlobs)
+			for i := 0; i < tt.numBlobs; i++ {
+				name := fmt.Sprintf("%s/%s/bloom-%d", tenantID, blockID, i)
+				want = append(want, "/blerg/"+name)
+				fmt.Fprintf(&blobs, `<Blob><Name>%s</Name><Properties>
+					<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+					<Etag>0x8CBFF45D8A29A19</Etag><Content-Length>1</Content-Length>
+					<BlobType>BlockBlob</BlobType></Properties></Blob>`, name)
+			}
+
+			var (
+				mtx      sync.Mutex
+				deleted  []string
+				inFlight uint
+				maxSeen  uint
+			)
+			server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+						<EnumerationResults><Blobs>` + blobs.String() + `</Blobs><NextMarker /></EnumerationResults>`))
+				case http.MethodDelete:
+					mtx.Lock()
+					inFlight++
+					maxSeen = max(maxSeen, inFlight)
+					mtx.Unlock()
+
+					// Hold the request open so overlapping deletes are observable.
+					time.Sleep(20 * time.Millisecond)
+
+					mtx.Lock()
+					inFlight--
+					deleted = append(deleted, r.URL.Path)
+					mtx.Unlock()
+					w.WriteHeader(http.StatusAccepted)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+
+			_, _, compactor, err := NewNoConfirm(&Config{
+				StorageAccountName: "testing_account",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Endpoint:           server.URL[7:], // [7:] -> strip http://
+			})
+			require.NoError(t, err)
+
+			require.NoError(t, compactor.ClearBlock(uuid.MustParse(blockID), tenantID))
+
+			mtx.Lock()
+			defer mtx.Unlock()
+
+			for i := range deleted {
+				deleted[i] = strings.TrimPrefix(deleted[i], "/testing_account")
+			}
+			assert.ElementsMatch(t, want, deleted, "every blob in the block must be deleted exactly once")
+			assert.Greater(t, maxSeen, uint(1), "deletes must be issued concurrently")
+			assert.LessOrEqual(t, maxSeen, tt.wantMax, "concurrency must stay within the bound")
+		})
+	}
+}
+
+func TestClearBlock_BlobDeleteErrors(t *testing.T) {
+	const (
+		tenantID = "test-tenant"
+		blockID  = "00000000-0000-0000-0000-000000000004"
+		numBlobs = 20
+	)
+
+	tests := []struct {
+		name string
+		// status returns the HTTP status to answer a DELETE for the nth blob.
+		status  func(n int) int
+		wantErr bool
+	}{
+		{"all deleted", func(int) int { return http.StatusAccepted }, false},
+		// Already gone is the outcome we wanted, so a 404 alone is not an error.
+		{"all already gone", func(int) int { return http.StatusNotFound }, false},
+		{"some already gone", func(n int) int {
+			if n%2 == 0 {
+				return http.StatusNotFound
+			}
+			return http.StatusAccepted
+		}, false},
+		// A real failure beside a 404 must not read as success, or retention
+		// drops the block and orphans its data.
+		{"one real failure among 404s", func(n int) int {
+			switch {
+			case n == 0:
+				return http.StatusForbidden
+			case n%2 == 0:
+				return http.StatusNotFound
+			default:
+				return http.StatusAccepted
+			}
+		}, true},
+		{"all fail", func(int) int { return http.StatusForbidden }, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var blobs strings.Builder
+			for i := 0; i < numBlobs; i++ {
+				fmt.Fprintf(&blobs, `<Blob><Name>%s/%s/bloom-%d</Name><Properties>
+					<Last-Modified>Fri, 01 Mar 2024 00:00:00 GMT</Last-Modified>
+					<Etag>0x8CBFF45D8A29A19</Etag><Content-Length>1</Content-Length>
+					<BlobType>BlockBlob</BlobType></Properties></Blob>`, tenantID, blockID, i)
+			}
+
+			var (
+				mtx      sync.Mutex
+				attempts int
+				seen     = map[string]struct{}{}
+			)
+			server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+						<EnumerationResults><Blobs>` + blobs.String() + `</Blobs><NextMarker /></EnumerationResults>`))
+				case http.MethodDelete:
+					mtx.Lock()
+					n := attempts
+					attempts++
+					seen[r.URL.Path] = struct{}{}
+					mtx.Unlock()
+
+					status := tt.status(n)
+					if status == http.StatusNotFound {
+						w.Header().Set("x-ms-error-code", string(bloberror.BlobNotFound))
+					}
+					w.WriteHeader(status)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+
+			_, _, compactor, err := NewNoConfirm(&Config{
+				StorageAccountName: "testing_account",
+				StorageAccountKey:  flagext.SecretWithValue("YQo="),
+				MaxBuffers:         3,
+				BufferSize:         1000,
+				ContainerName:      "blerg",
+				Endpoint:           server.URL[7:], // [7:] -> strip http://
+			})
+			require.NoError(t, err)
+
+			err = compactor.ClearBlock(uuid.MustParse(blockID), tenantID)
+
+			mtx.Lock()
+			defer mtx.Unlock()
+			assert.Len(t, seen, numBlobs, "every blob must be attempted even when one fails")
+
+			if tt.wantErr {
+				require.Error(t, err, "a real delete failure must be reported so the block is not treated as cleared")
+				require.NotErrorIs(t, err, backend.ErrDoesNotExist, "a mixed failure must not look like an already-gone block")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestListBlocksSharded(t *testing.T) {
+	const tenant = "single-tenant"
+
+	liveBlockIDs := []uuid.UUID{
+		uuid.MustParse("0aaaaaaa-0000-0000-0000-000000000000"),
+		uuid.MustParse("7bbbbbbb-0000-0000-0000-000000000000"),
+		uuid.MustParse("fccccccc-0000-0000-0000-000000000000"),
+	}
+	compactedBlockIDs := []uuid.UUID{
+		uuid.MustParse("3ddddddd-0000-0000-0000-000000000000"),
+	}
+
+	var (
+		mtx      sync.Mutex
+		prefixes []string
+	)
+
+	server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			return
+		}
+
+		prefix := r.URL.Query().Get("prefix")
+
+		mtx.Lock()
+		prefixes = append(prefixes, prefix)
+		mtx.Unlock()
+
+		// Only return the blobs the requested prefix actually covers, so a shard
+		// that drops results or trims the wrong prefix loses block IDs.
+		blobs := &strings.Builder{}
+		for _, id := range liveBlockIDs {
+			blobs.WriteString(listBlobXML(prefix, tenant, id, backend.MetaName))
+		}
+		for _, id := range compactedBlockIDs {
+			blobs.WriteString(listBlobXML(prefix, tenant, id, backend.CompactedMetaName))
+		}
+
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+			<EnumerationResults ServiceEndpoint="http://myaccount.blob.core.windows.net/" ContainerName="mycontainer">
+			  <Prefix>%s</Prefix>
+			  <Blobs>%s</Blobs>
+			  <NextMarker />
+			</EnumerationResults>`, prefix, blobs.String())
+	})
+
+	r, _, _, err := NewNoConfirm(&Config{
+		StorageAccountName:    "testing_account",
+		StorageAccountKey:     flagext.SecretWithValue("YQo="),
+		MaxBuffers:            3,
+		BufferSize:            1000,
+		ContainerName:         "blerg",
+		Endpoint:              server.URL[7:], // [7:] -> strip http://
+		ListBlocksConcurrency: 4,
+	})
+	require.NoError(t, err)
+
+	blockIDs, compacted, _, err := r.ListBlocks(context.Background(), tenant)
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, liveBlockIDs, blockIDs)
+	assert.ElementsMatch(t, compactedBlockIDs, compacted)
+
+	expectedPrefixes := make([]string, 0, listBlocksShards)
+	for i := 0; i < listBlocksShards; i++ {
+		expectedPrefixes = append(expectedPrefixes, tenant+"/"+strconv.FormatInt(int64(i), 16))
+	}
+	assert.ElementsMatch(t, expectedPrefixes, prefixes)
+}
+
+// The tenant index blobs sit beside the block directories under the tenant
+// prefix, so a listing has to tolerate them without reading them as blocks.
+// They are single segment names, which is what the len(parts) check is for.
+func TestListBlocksWithTenantIndex(t *testing.T) {
+	const tenant = "single-tenant"
+
+	blockID := uuid.MustParse("0aaaaaaa-0000-0000-0000-000000000000")
+	indexNames := []string{tenant + "/" + backend.TenantIndexName, tenant + "/" + backend.TenantIndexNamePb}
+	allNames := append([]string{tenant + "/" + blockID.String() + "/" + backend.MetaName}, indexNames...)
+
+	for _, concurrency := range []int{1, 4} {
+		t.Run(fmt.Sprintf("concurrency-%d", concurrency), func(t *testing.T) {
+			var (
+				mtx    sync.Mutex
+				served []string
+			)
+
+			server := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					return
+				}
+
+				prefix := r.URL.Query().Get("prefix")
+
+				blobs := &strings.Builder{}
+				for _, name := range allNames {
+					entry := listBlobXMLForName(prefix, name)
+					if entry == "" {
+						continue
+					}
+
+					mtx.Lock()
+					served = append(served, name)
+					mtx.Unlock()
+					blobs.WriteString(entry)
+				}
+
+				_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+					<EnumerationResults ServiceEndpoint="http://myaccount.blob.core.windows.net/" ContainerName="mycontainer">
+					  <Prefix>%s</Prefix>
+					  <Blobs>%s</Blobs>
+					  <NextMarker />
+					</EnumerationResults>`, prefix, blobs.String())
+			})
+
+			r, _, _, err := NewNoConfirm(&Config{
+				StorageAccountName:    "testing_account",
+				StorageAccountKey:     flagext.SecretWithValue("YQo="),
+				MaxBuffers:            3,
+				BufferSize:            1000,
+				ContainerName:         "blerg",
+				Endpoint:              server.URL[7:], // [7:] -> strip http://
+				ListBlocksConcurrency: concurrency,
+			})
+			require.NoError(t, err)
+
+			blockIDs, compacted, _, err := r.ListBlocks(context.Background(), tenant)
+			require.NoError(t, err)
+
+			assert.Equal(t, []uuid.UUID{blockID}, blockIDs)
+			assert.Empty(t, compacted)
+
+			if concurrency > 1 {
+				// Sharding on the leading hex digit never reaches the index blobs.
+				assert.NotSubset(t, served, indexNames)
+				return
+			}
+			assert.Subset(t, served, indexNames)
+		})
+	}
+}
+
+func listBlobXML(prefix, tenant string, id uuid.UUID, name string) string {
+	return listBlobXMLForName(prefix, tenant+"/"+id.String()+"/"+name)
+}
+
+// listBlobXMLForName emits an entry only when the requested prefix covers
+// blobName, so the fake server filters the way the service would.
+func listBlobXMLForName(prefix, blobName string) string {
+	if !strings.HasPrefix(blobName, prefix) {
+		return ""
+	}
+
+	return fmt.Sprintf(`<Blob><Name>%s</Name><Properties><Content-Length>100</Content-Length><BlobType>BlockBlob</BlobType></Properties></Blob>`, blobName)
+}

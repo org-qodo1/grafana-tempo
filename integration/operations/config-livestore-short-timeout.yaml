@@ -1,0 +1,3 @@
+live_store:
+  # the lookback is 2x this and must outlast a live-store cold start
+  complete_block_timeout: 5s
